@@ -1,0 +1,1262 @@
+---
+title: "Simulation Study"
+author: "Anika, Ben, Duncan, Layla"
+date: "2025-06-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# RUN THIS BEFORE MAIN
+Generate data
+```{r}
+genData <- function(n, p, range, smoothness, tau2, gam) {
+  library(fields)
+  library(purrr)
+### Functions
+
+genX <- function(m,range=0.1,smoothness=2){
+  # m has to be a power of 2!
+  library(spectralGP)
+  capture.output(X  <- gp(c(m,m),matern.specdens,c(range,smoothness)))
+  simulate(X)
+  X <- matrix(X$process,m,m)
+  return(as.vector(X))
+}
+
+logistic_func <- function(x){
+  return(1/(1+exp(-x)))
+}
+
+# generates D
+h1 <- function(x){
+  return(0.04 * (10 * sin(pi*x[1]*x[2])+20*(x[3]-0.5)^2 + 10 * x[4] +5 * x[5]))
+}
+
+# generates Y0 and Y1
+h2 <- function(xstar,gamma = 1){
+  
+  # xstar 6 is the time
+  # xstar 7 is the treatment
+  return(xstar[1] + xstar[1] * xstar[6] + 3 * xstar[4] + 5 * xstar[5] * xstar[6] + gam * xstar[6] * xstar[7])
+}
+
+generate_data <- function(n,p,range,smoothness,tau2,h1,h2,gam,link = "logit"){
+  
+  X <- NULL
+  for(i in 1:p){
+    
+    X <- cbind(X,genX(n,range,smoothness))
+  }
+  
+  # Uses logit link
+  if(link == "logit"){
+    p_vect <- logistic_func(apply(X,1,h1))
+  }
+  # Uses probit link
+  else if(link == "probit"){
+    p_vect <- pnorm(h1(X))
+  }
+  
+  # 
+  else{
+    return("not a valid link function")
+  }
+  
+  nstar <- nrow(X)
+  D_samp <- sapply(p_vect,rbinom,size = 1,n = 1)
+  
+  # Design matrix to generate Y
+  time_vect <- c(rep(0,nstar),rep(1,nstar))
+  
+  ### Covariates, time, Treatment
+  X_star <- cbind(rbind(X,X),time_vect,c(D_samp,D_samp))
+  
+  Y <- apply(X_star,1,h2,gamma=gam) + rnorm(2*nstar,mean = 0,sd = sqrt(tau2))
+  Y0 <- Y[1:nstar ]
+  Y1 <- Y[(nstar +1):(2*nstar )]
+  
+  return(list(X = X,X_star = X_star,Y0 = Y0,Y1 = Y1,D= D_samp,time_vect = time_vect))
+}
+
+dat1 <- generate_data(n,p,range,smoothness,tau2,h1,h2,gam)
+
+# add longitude and latitude into data generating process
+longitude_m <- matrix(rep(seq(0, 1, length.out = n), each = n), nrow = n, ncol = n, byrow = FALSE)
+latitude_m <- matrix(rep(seq(0, 1, length.out = n), times = n), nrow = n, ncol = n)
+longitude_v <- as.vector(longitude_m)
+latitude_v <- as.vector(latitude_m)
+
+# make into data frame
+df <- data.frame(cbind(dat1$X, dat1$D, dat1$Y0, dat1$Y1, longitude_v, latitude_v))
+
+na_df <- cbind(as.numeric(rbernoulli(n = 1024, p = 0.8)), as.numeric(rbernoulli(n = 1024, p = 0.8)))
+df <- cbind(df, na_df)
+
+nrow <- 32
+ncol <- 32
+
+for (i in seq(1024)){ #assigning NA values to random YO and Y1 entries
+  i <- as.integer(i)
+  
+  if (df[i, 11] == 0){ #assigning NA to Y0 (col 7) based on the bernoulli val in col 11
+    df[i, 7] <- NA
+  }
+  
+  if (df[i,12] == 0){ #assigning NA to Y1 (col 8) based on the bernoulli val in col 12
+    df[i, 8] <- NA
+  }
+  
+}
+
+return(df[,c(1:10)])
+
+}
+```
+
+# RUN THIS BEFORE MAIN
+Functions 
+```{r}
+library(estimatr)
+library(dbarts)
+library(BART)
+
+# DML function for simulation study (no spatial without crossfitting)
+DML_noSpatial <- function(df, nrow, ncol) {
+  
+  # number of pixels
+  n <- nrow*ncol
+  
+  # Handle NA values
+  valid_Y0 <- !is.na(df[,7])
+  valid_Y1 <- !is.na(df[,8])
+  valid_D <- !is.na(df[,6])
+  
+  # BART f0
+  x <- df[,c(1:3)]
+  y <- df[,7]
+  bart_fitY0 <- bart(x.train = x[valid_Y0,], y.train = y[valid_Y0])
+  
+  # BART f1
+  y <- df[,8]
+  bart_fitY1 <- bart(x.train = x[valid_Y1,], y.train = y[valid_Y1])
+  
+  # BART g
+  y <- df[,6]
+  bart_fit_g <- pbart(x.train = x[valid_D,], y.train = y[valid_D])
+  predicted_g <- bart_fit_g$prob.train.mean
+  
+  # residuals
+  R_Y0 <- rep(NA, n)
+  R_Y0[valid_Y0] <- df[valid_Y0,7] - bart_fitY0$yhat.train.mean
+  R_Y1 <- rep(NA, n)
+  R_Y1[valid_Y1] <- df[valid_Y1,8] - bart_fitY1$yhat.train.mean
+  R_D <- rep(NA, n)
+  R_D[valid_D] <- df[valid_D,6] - predicted_g
+
+  # calculate local mean
+  R_D_m <- matrix(R_D, nrow, ncol)
+  localR_D_m <- matrix(NA, nrow, ncol)
+  for (i in 1:nrow) {
+    for (j in 1:ncol) {
+      # get surroundings (rook)
+      # consider all cases
+      if (i == 1) {
+        if (j == 1) {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i, j+1])
+        }
+        else if (j == ncol) {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i, j-1])
+        }
+        else {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i, j+1], R_D_m[i, j-1])
+        }
+      }
+      else if (i == nrow) {
+        if (j == 1) {
+          neighbors <- c(R_D_m[i-1, j], R_D_m[i, j+1])
+        }
+        else if (j == ncol) {
+          neighbors <- c(R_D_m[i-1, j], R_D_m[i, j-1])
+        }
+        else {
+          neighbors <- c(R_D_m[i-1, j], R_D_m[i, j+1], R_D_m[i, j-1])
+        }      
+      }
+      else {
+        if (j == 1) {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i-1, j], R_D_m[i, j+1])
+        }
+        else if (j == ncol) {
+        neighbors <- c(R_D_m[i+1, j], R_D_m[i-1, j], R_D_m[i, j-1])
+        }
+        else {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i-1, j], 
+                         R_D_m[i, j+1], R_D_m[i, j-1])
+        }
+      }
+    localR_D_m[i,j] <- mean(na.omit(neighbors))   
+    }
+  }
+  localR_D <- as.vector(localR_D_m)
+
+  # regression
+  t <- c(rep(0, n), rep(1, n))
+  regress_DML_noCross <- lm(c(R_Y0, R_Y1) ~ t + c(R_D, R_D) + c(localR_D, localR_D) + t*c(R_D, R_D) + t*c(localR_D, localR_D))
+  regress_robust_DML_noCross <- lm_robust(c(R_Y0, R_Y1) ~ t + c(R_D, R_D) + c(localR_D, localR_D) + t*c(R_D, R_D) + t*c(localR_D, localR_D))
+  return(list(regress_DML_noCross, regress_robust_DML_noCross))
+}
+
+##############################################
+
+# DML function for simulation study NO spatial (with crossfitting)
+DML_noSpatial_cross <- function(df, nrow, ncol) {
+  library(estimatr)
+  library(dbarts)
+  library(caret)
+  library(dplyr)
+  
+  # number of pixels
+  n <- nrow*ncol
+
+  #BART f0
+  x <- df[,c(1:3, 9, 10)]
+  y <- df[,7]
+  dfw_f0 <- cbind(x, y, seq(1, 1024))
+  dfw_f0 <- na.omit(dfw_f0)
+  f0x <- dfw_f0[,c(1:3)] #these are confounders with lat and long
+  f0y <- dfw_f0[,6] #this is y
+  
+  
+  # split data into 10 folds
+  folds <- createFolds(f0y, k = 10)
+  
+  # initialize placeholder for predictions
+  pred_Y0 <- data.frame(rep(NA, length(f0y)), dfw_f0[,7])
+  
+  # crossfitting Y0
+  for (fold in seq_along(folds)) {
+  
+    # this is the training data set
+    train_idx <- setdiff(dfw_f0$`seq(1, 1024)`, folds[[fold]])
+  
+    # ith fold
+    test_idx <- folds[[fold]]
+  
+    # trains a bart model to predict Y0
+    bart_preds <- bart(x.train = dfw_f0[c(train_idx), 1:3], y.train = dfw_f0[c(train_idx), 6], x.test = dfw_f0[c(test_idx), c(1:3)])
+  
+    # storing the predicted bart data into the placeholder vectors
+    pred_Y0[test_idx,1] <- bart_preds$yhat.test.mean
+  }
+  
+  seq_df <- data.frame(seq(1, 1024))
+  predict_Y0 <- rep(NA, n)
+  predict_Y0[c(pred_Y0[,2])] <- c(pred_Y0[,1])
+  
+  #BART f1
+  x <- df[,c(1:3, 9, 10)]
+  y <- df[,8]
+  dfw_f1 <- cbind(x, y, seq(1, 1024))
+  dfw_f1 <- na.omit(dfw_f1)
+  f1x <- dfw_f1[,c(1:3)] #these are confounders with lat and long
+  f1y <- dfw_f1[,6] #this is y
+  
+  # split data into 10 folds
+  folds <- createFolds(f1y, k = 10)
+  
+  # initialize placeholder for predictions
+  pred_Y1 <- data.frame(rep(NA, length(f1y)), dfw_f1[,7])
+  
+  # crossfitting Y1
+  for (fold in seq_along(folds)) {
+  
+    # this is the training data set
+    train_idx <- setdiff(dfw_f1$`seq(1, 1024)`, folds[[fold]])
+  
+    # ith fold
+    test_idx <- folds[[fold]]
+  
+    # trains a bart model to predict Y0
+    bart_preds <- bart(x.train = dfw_f1[c(train_idx), 1:3], y.train = dfw_f1[c(train_idx), 6], x.test = dfw_f1[c(test_idx), c(1:3)])
+  
+    # storing the predicted bart data into the placeholder vectors
+    pred_Y1[test_idx,1] <- bart_preds$yhat.test.mean
+  }
+  
+  seq_df <- data.frame(seq(1, 1024))
+  predict_Y1 <- rep(NA, n)
+  predict_Y1[c(pred_Y1[,2])] <- c(pred_Y1[,1])
+  
+  #BART g
+  x <- df[,c(1:3)]
+  y <- df[,6]
+  
+  # split data into 10 folds
+  folds <- createFolds(y, k = 10)
+  
+  # initialize placeholder for predictions
+  predict_D <- rep(NA, n)
+  
+  # crossfitting D
+  for (fold in seq_along(folds)) {
+  
+    # this is the training data set
+    train_idx <- setdiff(seq_len(n), folds[[fold]])
+  
+    # ith fold
+    test_idx <- folds[[fold]]
+  
+    # storing the predicted bart data into the placeholder vectors
+    bart_preds <- pbart(x.train = x[train_idx,], y.train = y[train_idx], x.test = x[test_idx,])
+    predict_D[test_idx] <- bart_preds$prob.test.mean
+    
+  }
+
+  # residuals
+  R_Y0 <- df[,7] - predict_Y0
+  R_Y1 <- df[,8] - predict_Y1
+  R_D <- df[,6] - predict_D
+  
+  # calculate local mean
+  R_D_m <- matrix(R_D, nrow, ncol)
+  localR_D_m <- matrix(NA, nrow, ncol)
+  for (i in 1:nrow) {
+    for (j in 1:ncol) {
+      # get surroundings (rook)
+      # consider all cases
+      if (i == 1) {
+        if (j == 1) {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i, j+1])
+        }
+        else if (j == ncol) {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i, j-1])
+        }
+        else {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i, j+1], R_D_m[i, j-1])
+        }
+      }
+      else if (i == nrow) {
+        if (j == 1) {
+          neighbors <- c(R_D_m[i-1, j], R_D_m[i, j+1])
+        }
+        else if (j == ncol) {
+          neighbors <- c(R_D_m[i-1, j], R_D_m[i, j-1])
+        }
+        else {
+          neighbors <- c(R_D_m[i-1, j], R_D_m[i, j+1], R_D_m[i, j-1])
+        }      
+      }
+      else {
+        if (j == 1) {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i-1, j], R_D_m[i, j+1])
+        }
+        else if (j == ncol) {
+        neighbors <- c(R_D_m[i+1, j], R_D_m[i-1, j], R_D_m[i, j-1])
+        }
+        else {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i-1, j], 
+                         R_D_m[i, j+1], R_D_m[i, j-1])
+        }
+      }
+    localR_D_m[i,j] <- mean(na.omit(neighbors))   
+    }
+  }
+  localR_D <- as.vector(localR_D_m)
+
+  # regression
+  t <- c(rep(0, n), rep(1, n))
+  regress_DML <- lm(c(R_Y0, R_Y1) ~ t + c(R_D, R_D) + c(localR_D, localR_D) + t*c(R_D, R_D) + t*c(localR_D, localR_D))
+  regress_robust_DML <- lm_robust(c(R_Y0, R_Y1) ~ t + c(R_D, R_D) + c(localR_D, localR_D) + t*c(R_D, R_D) + t*c(localR_D, localR_D))
+  return(list(regress_DML, regress_robust_DML))
+}
+
+
+#############################################
+
+# DML function for simulation study (without crossfitting)
+DML_noCross <- function(df, nrow, ncol) {
+  
+  # number of pixels
+  n <- nrow*ncol
+  
+  # Handle NA values
+  valid_Y0 <- !is.na(df[,7])
+  valid_Y1 <- !is.na(df[,8])
+  valid_D <- !is.na(df[,6])
+  
+  # BART f0
+  x <- df[,c(1:3, 9:10)]
+  y <- df[,7]
+  bart_fitY0 <- bart(x.train = x[valid_Y0,], y.train = y[valid_Y0])
+  
+  # BART f1
+  y <- df[,8]
+  bart_fitY1 <- bart(x.train = x[valid_Y1,], y.train = y[valid_Y1])
+  
+  # BART g
+  y <- df[,6]
+  bart_fit_g <- pbart(x.train = x[valid_D,], y.train = y[valid_D])
+  predicted_g <- bart_fit_g$prob.train.mean
+  
+  # residuals
+  R_Y0 <- rep(NA, n)
+  R_Y0[valid_Y0] <- df[valid_Y0,7] - bart_fitY0$yhat.train.mean
+  R_Y1 <- rep(NA, n)
+  R_Y1[valid_Y1] <- df[valid_Y1,8] - bart_fitY1$yhat.train.mean
+  R_D <- rep(NA, n)
+  R_D[valid_D] <- df[valid_D,6] - predicted_g
+
+  # calculate local mean
+  R_D_m <- matrix(R_D, nrow, ncol)
+  localR_D_m <- matrix(NA, nrow, ncol)
+  for (i in 1:nrow) {
+    for (j in 1:ncol) {
+      # get surroundings (rook)
+      # consider all cases
+      if (i == 1) {
+        if (j == 1) {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i, j+1])
+        }
+        else if (j == ncol) {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i, j-1])
+        }
+        else {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i, j+1], R_D_m[i, j-1])
+        }
+      }
+      else if (i == nrow) {
+        if (j == 1) {
+          neighbors <- c(R_D_m[i-1, j], R_D_m[i, j+1])
+        }
+        else if (j == ncol) {
+          neighbors <- c(R_D_m[i-1, j], R_D_m[i, j-1])
+        }
+        else {
+          neighbors <- c(R_D_m[i-1, j], R_D_m[i, j+1], R_D_m[i, j-1])
+        }      
+      }
+      else {
+        if (j == 1) {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i-1, j], R_D_m[i, j+1])
+        }
+        else if (j == ncol) {
+        neighbors <- c(R_D_m[i+1, j], R_D_m[i-1, j], R_D_m[i, j-1])
+        }
+        else {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i-1, j], 
+                         R_D_m[i, j+1], R_D_m[i, j-1])
+        }
+      }
+    localR_D_m[i,j] <- mean(na.omit(neighbors))   
+    }
+  }
+  localR_D <- as.vector(localR_D_m)
+
+  # regression
+  t <- c(rep(0, n), rep(1, n))
+  regress_DML_noCross <- lm(c(R_Y0, R_Y1) ~ t + c(R_D, R_D) + c(localR_D, localR_D) + t*c(R_D, R_D) + t*c(localR_D, localR_D))
+  regress_robust_DML_noCross <- lm_robust(c(R_Y0, R_Y1) ~ t + c(R_D, R_D) + c(localR_D, localR_D) + t*c(R_D, R_D) + t*c(localR_D, localR_D))
+  return(list(regress_DML_noCross, regress_robust_DML_noCross))
+}
+
+#########################################
+# DML function for simulation study lat/long only (with crossfitting)
+DML <- function(df, nrow, ncol) {
+  library(estimatr)
+  library(dbarts)
+  library(caret)
+  library(dplyr)
+  
+  # number of pixels
+  n <- nrow*ncol
+
+  #BART f0
+  x <- df[,c(1:3, 9, 10)]
+  y <- df[,7]
+  dfw_f0_ <- cbind(x, y, seq(1, 1024))
+  dfw_f0 <- na.omit(dfw_f0_)
+  f0x <- dfw_f0[,c(1:5)] #these are confounders with lat and long
+  f0y <- dfw_f0[,6] #this is y
+  
+  
+  # split data into 10 folds
+  folds <- createFolds(f0y, k = 10)
+  
+  # initialize placeholder for predictions
+  pred_Y0 <- data.frame(rep(NA, length(f0y)), dfw_f0[,7])
+  
+  # crossfitting Y0
+  for (fold in seq_along(folds)) {
+  
+    # this is the training data set
+    train_idx <- setdiff(dfw_f0$`seq(1, 1024)`, folds[[fold]])
+  
+    # ith fold
+    test_idx <- folds[[fold]]
+  
+    # trains a bart model to predict Y0
+    bart_preds <- bart(x.train = dfw_f0[c(train_idx), 1:5], y.train = dfw_f0[c(train_idx), 6], x.test = dfw_f0[c(test_idx), c(1:5)])
+  
+    # storing the predicted bart data into the placeholder vectors
+    pred_Y0[test_idx,1] <- bart_preds$yhat.test.mean
+  }
+  
+  seq_df <- data.frame(seq(1, 1024))
+  predict_Y0 <- rep(NA, n)
+  predict_Y0[c(pred_Y0[,2])] <- c(pred_Y0[,1])
+  
+  #BART f1
+  x <- df[,c(1:3, 9, 10)]
+  y <- df[,8]
+  dfw_f1 <- cbind(x, y, seq(1, 1024))
+  dfw_f1 <- na.omit(dfw_f1)
+  f1x <- dfw_f1[,c(1:5)] #these are confounders with lat and long
+  f1y <- dfw_f1[,6] #this is y
+  
+  # split data into 10 folds
+  folds <- createFolds(f1y, k = 10)
+  
+  # initialize placeholder for predictions
+  pred_Y1 <- data.frame(rep(NA, length(f1y)), dfw_f1[,7])
+  
+  # crossfitting Y0
+  for (fold in seq_along(folds)) {
+  
+    # this is the training data set
+    train_idx <- setdiff(dfw_f1$`seq(1, 1024)`, folds[[fold]])
+  
+    # ith fold
+    test_idx <- folds[[fold]]
+  
+    # trains a bart model to predict Y0
+    bart_preds <- bart(x.train = dfw_f1[c(train_idx), 1:5], y.train = dfw_f1[c(train_idx), 6], x.test = dfw_f1[c(test_idx), c(1:5)])
+  
+    # storing the predicted bart data into the placeholder vectors
+    pred_Y1[test_idx,1] <- bart_preds$yhat.test.mean
+  }
+  
+  seq_df <- data.frame(seq(1, 1024))
+  predict_Y1 <- rep(NA, n)
+  predict_Y1[c(pred_Y1[,2])] <- c(pred_Y1[,1])
+  
+  #BART g
+  y <- df[,6]
+  
+  # split data into 10 folds
+  folds <- createFolds(y, k = 10)
+  
+  # initialize placeholder for predictions
+  predict_D <- rep(NA, n)
+  
+  # crossfitting D
+  for (fold in seq_along(folds)) {
+  
+    # this is the training data set
+    train_idx <- setdiff(seq_len(n), folds[[fold]])
+  
+    # ith fold
+    test_idx <- folds[[fold]]
+  
+    # storing the predicted bart data into the placeholder vectors
+    bart_preds <- pbart(x.train = x[train_idx,], y.train = y[train_idx], x.test = x[test_idx,])
+    predict_D[test_idx] <- bart_preds$prob.test.mean
+    
+  }
+
+  # residuals
+  R_Y0 <- df[,7] - predict_Y0
+  R_Y1 <- df[,8] - predict_Y1
+  R_D <- df[,6] - predict_D
+  
+  # calculate local mean
+  R_D_m <- matrix(R_D, nrow, ncol)
+  localR_D_m <- matrix(NA, nrow, ncol)
+  for (i in 1:nrow) {
+    for (j in 1:ncol) {
+      # get surroundings (rook)
+      # consider all cases
+      if (i == 1) {
+        if (j == 1) {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i, j+1])
+        }
+        else if (j == ncol) {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i, j-1])
+        }
+        else {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i, j+1], R_D_m[i, j-1])
+        }
+      }
+      else if (i == nrow) {
+        if (j == 1) {
+          neighbors <- c(R_D_m[i-1, j], R_D_m[i, j+1])
+        }
+        else if (j == ncol) {
+          neighbors <- c(R_D_m[i-1, j], R_D_m[i, j-1])
+        }
+        else {
+          neighbors <- c(R_D_m[i-1, j], R_D_m[i, j+1], R_D_m[i, j-1])
+        }      
+      }
+      else {
+        if (j == 1) {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i-1, j], R_D_m[i, j+1])
+        }
+        else if (j == ncol) {
+        neighbors <- c(R_D_m[i+1, j], R_D_m[i-1, j], R_D_m[i, j-1])
+        }
+        else {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i-1, j], 
+                         R_D_m[i, j+1], R_D_m[i, j-1])
+        }
+      }
+    localR_D_m[i,j] <- mean(na.omit(neighbors))   
+    }
+  }
+  localR_D <- as.vector(localR_D_m)
+
+  # regression
+  t <- c(rep(0, n), rep(1, n))
+  regress_DML <- lm(c(R_Y0, R_Y1) ~ t + c(R_D, R_D) + c(localR_D, localR_D) + t*c(R_D, R_D) + t*c(localR_D, localR_D))
+  regress_robust_DML <- lm_robust(c(R_Y0, R_Y1) ~ t + c(R_D, R_D) + c(localR_D, localR_D) + t*c(R_D, R_D) + t*c(localR_D, localR_D))
+  return(list(regress_DML, regress_robust_DML))
+}
+
+
+################################################
+# OLS
+# number of pixels
+OLS <- function (df, nrow, ncol) {
+  n <- nrow*ncol
+  t <- c(rep(0, n), rep(1, n))
+  c_df <- rbind(df, df)
+  regress_OLS <- lm(c(df[,7], df[,8]) ~ c_df[,1] + c_df[,2] + c_df[,3] 
+                    + t + c_df[,6] + t*c_df[,6])
+  regress_robust_OLS <- lm_robust(c(df[,7], df[,8]) ~ c_df[,1] + c_df[,2] +  c_df[,5] 
+                                  + t + c_df[,6] + t*c_df[,6])
+  return(regress_robust_OLS)
+}
+
+
+#################################################
+# DID
+# number of pixels
+DID <- function (df, nrow, ncol) {
+  n <- nrow*ncol
+
+  # DBar Creation
+  D_m <- matrix(df[,6], 32, 32)
+  loc_D <- matrix(NA, 32, 32)
+
+  for (i in 1:nrow(D_m)) {
+    for (j in 1:ncol(D_m)) {
+      # get surroundings (rook)
+      # consider all cases
+      if (i == 1) {
+        if (j == 1) {
+          neighbors <- c(D_m[i+1, j], D_m[i, j+1])
+        }
+        else if (j == 32) {
+          neighbors <- c(D_m[i+1, j], D_m[i, j-1])
+        }
+        else {
+          neighbors <- c(D_m[i+1, j], D_m[i, j+1], D_m[i, j-1])
+        }
+      }
+      else if (i == 32) {
+        if (j == 1) {
+          neighbors <- c(D_m[i-1, j], D_m[i, j+1])
+        }
+        else if (j == 32) {
+          neighbors <- c(D_m[i-1, j], D_m[i, j-1])
+        }
+        else {
+          neighbors <- c(D_m[i-1, j], D_m[i, j+1], D_m[i, j-1])
+        }      
+      }
+      else {
+        if (j == 1) {
+          neighbors <- c(D_m[i+1, j], D_m[i-1, j], D_m[i, j+1])
+        }
+        else if (j == 32) {
+          neighbors <- c(D_m[i+1, j], D_m[i-1, j], D_m[i, j-1])
+        }
+        else {
+          neighbors <- c(D_m[i+1, j], D_m[i-1, j], D_m[i, j+1], D_m[i, j-1])
+        }
+      }
+      loc_D[i,j] <- mean(na.omit(neighbors))  
+    }
+  }
+  loc_D_v <- as.vector(loc_D)
+
+  # regression
+  t <- c(rep(0, n), rep(1, n))
+  c_df <- rbind(df, df)
+  regress_DID <- lm(c(df[,7], df[,8]) ~ c_df[,1] + c_df[,2] + c_df[,3]
+                      + t + c_df[,6] + c(loc_D_v, loc_D_v) + 
+                      t*c_df[,6] + t*c(loc_D_v, loc_D_v))
+  regress_robust_DID <- lm_robust(c(df[,7], df[,8]) ~ c_df[,1] + c_df[,2] + c_df[,3] 
+                                  + t + c_df[,6] + c(loc_D_v, loc_D_v) + 
+                                    t*c_df[,6] + t*c(loc_D_v, loc_D_v))
+  return(regress_robust_DID)
+}
+
+
+################################
+
+# DML function with Wendland for simulation study (without crossfitting)
+DML_wend <- function(df, nrow, ncol) {
+
+  #This is a Wendland Kernel 
+  basis_wend <- function(s,u,theta){
+  
+  d1 <- rdist(s,u)/theta
+
+  # Wendland basis function from Nychka  
+  mat1 <- apply(d1,c(1,2),function(x){
+    if(x <= 1){
+      return( (1-x)^6 * (36*x^2 +18*x + 3)/3)
+    }else{
+      return(0)
+    }
+  })
+  
+  return(mat1)
+
+  
+  }
+    m <- 32
+    n <- m^2
+    # s is spatial locations
+    s <- expand.grid((1:m)/(m+1),(1:m)/(m+1))
+    l     <- 10
+    L     <- l^2
+    # knot points
+    u     <- expand.grid(seq(0,1,length=l),seq(0,1,length=l))
+    #bandwidth parameter 2.5
+    Z     <- basis_wend(s,u,2.5/l)
+    
+    
+  df_w <- cbind(df, Z)
+  
+  # number of pixels
+  n <- nrow*ncol
+  
+  # Handle NA values
+  valid_Y0 <- !is.na(df[,7])
+  valid_Y1 <- !is.na(df[,8])
+  valid_D <- !is.na(df[,6])
+  
+  # BART f0
+  x <- df_w[,c(1:3, 9:ncol(df_w))]
+  y <- df_w[,7]
+  bart_fitY0 <- bart(x.train = x[valid_Y0,], y.train = y[valid_Y0])
+  
+  # BART f1
+  y <- df_w[,8]
+  bart_fitY1 <- bart(x.train = x[valid_Y1,], y.train = y[valid_Y1])
+  
+  # BART g
+  y <- df_w[,6]
+  bart_fit_g <- pbart(x.train = x[valid_D,], y[valid_D])
+  predicted_g <- bart_fit_g$prob.train.mean
+  
+  # residuals
+  R_Y0 <- rep(NA, n)
+  R_Y0[valid_Y0] <- df[valid_Y0,7] - bart_fitY0$yhat.train.mean
+  R_Y1 <- rep(NA, n)
+  R_Y1[valid_Y1] <- df[valid_Y1,8] - bart_fitY1$yhat.train.mean
+  R_D <- rep(NA, n)
+  R_D[valid_D] <- df[valid_D,6] - predicted_g
+  
+  # calculate local mean
+  R_D_m <- matrix(R_D, 32, 32)
+  localR_D_m <- matrix(NA, 32, 32)
+  for (i in 1:32) {
+    for (j in 1:32) {
+      # get surroundings (rook)
+      # consider all cases
+      if (i == 1) {
+        if (j == 1) {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i, j+1])
+        }
+        else if (j == 32) {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i, j-1])
+        }
+        else {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i, j+1], R_D_m[i, j-1])
+        }
+      }
+      else if (i == 32) {
+        if (j == 1) {
+          neighbors <- c(R_D_m[i-1, j], R_D_m[i, j+1])
+        }
+        else if (j == 32) {
+          neighbors <- c(R_D_m[i-1, j], R_D_m[i, j-1])
+        }
+        else {
+          neighbors <- c(R_D_m[i-1, j], R_D_m[i, j+1], R_D_m[i, j-1])
+        }      
+      }
+      else {
+        if (j == 1) {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i-1, j], R_D_m[i, j+1])
+        }
+        else if (j == 32) {
+        neighbors <- c(R_D_m[i+1, j], R_D_m[i-1, j], R_D_m[i, j-1])
+        }
+        else {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i-1, j], 
+                         R_D_m[i, j+1], R_D_m[i, j-1])
+        }
+      }
+    localR_D_m[i,j] <- mean(na.omit(neighbors))   
+    }
+  }
+  localR_D <- as.vector(localR_D_m)
+
+  # regression
+  t <- c(rep(0, n), rep(1, n))
+  regress_DML_noCross <- lm(c(R_Y0, R_Y1) ~ t + c(R_D, R_D) + c(localR_D, localR_D) + t*c(R_D, R_D) + t*c(localR_D, localR_D))
+  regress_robust_DML_noCross <- lm_robust(c(R_Y0, R_Y1) ~ t + c(R_D, R_D) + c(localR_D, localR_D) + t*c(R_D, R_D) + t*c(localR_D, localR_D))
+  summary(regress_DML_noCross)
+  summary(regress_robust_DML_noCross)
+  return(list(regress_DML_noCross, regress_robust_DML_noCross))
+}
+
+
+#########################################################
+
+# Wendland with Crossfitting
+
+DML_wend_cross <- function(df, nrow, ncol) {
+
+  #This is a Wendland Kernel 
+  basis_wend <- function(s,u,theta){
+  
+  d1 <- rdist(s,u)/theta
+
+  # Wendland basis function from Nychka  
+  mat1 <- apply(d1,c(1,2),function(x){
+    if(x <= 1){
+      return( (1-x)^6 * (36*x^2 +18*x + 3)/3)
+    }else{
+      return(0)
+    }
+  })
+  
+  return(mat1)
+
+              
+    }
+    m <- 32
+    n <- m^2
+    # s is spatial locations
+    s <- expand.grid((1:m)/(m+1),(1:m)/(m+1))
+    l     <- 10
+    L     <- l^2
+    # knot points
+    u     <- expand.grid(seq(0,1,length=l),seq(0,1,length=l))
+    #bandwidth parameter 2.5
+    Z     <- basis_wend(s,u,2.5/l)
+    
+    df_w <- cbind(df, Z)
+  
+    
+  #BART f0
+  x <- df_w[,c(1:3, 9:ncol(df_w))]
+  y <- df[,7]
+  dfw_f0 <- cbind(y, seq(1, 1024), x)
+  dfw_f0 <- na.omit(dfw_f0)
+  f0x <- dfw_f0[,c(3: ncol(dfw_f0))] #these are confounders with lat and long
+  f0y <- dfw_f0[,1] #this is y
+  
+  
+  # split data into 10 folds
+  folds <- createFolds(f0y, k = 10)
+  
+  # initialize placeholder for predictions
+  pred_Y0 <- data.frame(rep(NA, length(f0y)), dfw_f0[,2])
+  
+  # crossfitting Y0
+  for (fold in seq_along(folds)) {
+  
+    # this is the training data set
+    train_idx <- setdiff(dfw_f0$`seq(1, 1024)`, folds[[fold]])
+  
+    # ith fold
+    test_idx <- folds[[fold]]
+  
+    # trains a bart model to predict Y0
+    xtrain <- data.frame(dfw_f0[c(train_idx), c(3:ncol(dfw_f0))])
+    xtest <- data.frame(dfw_f0[c(test_idx), c(3:ncol(dfw_f0))])
+    ytrain <- (dfw_f0[c(train_idx), 1])
+    bart_preds <- bart(x.train = xtrain, y.train = ytrain, x.test = xtest)
+  
+    # storing the predicted bart data into the placeholder vectors
+    pred_Y0[test_idx,1] <- bart_preds$yhat.test.mean
+  }
+  
+  seq_df <- data.frame(seq(1, 1024))
+  predict_Y0 <- rep(NA, n)
+  predict_Y0[c(pred_Y0[,2])] <- c(pred_Y0[,1])
+  
+#BART f1
+  x <- df_w[,c(1:3, 9:ncol(df_w))]
+  y <- df[,8]
+  dfw_f1 <- cbind(y, seq(1, 1024), x)
+  dfw_f1 <- na.omit(dfw_f1)
+  f1x <- dfw_f1[,c(3: ncol(dfw_f1))] #these are confounders with lat and long
+  f1y <- dfw_f1[,1] #this is y
+  
+  
+  # split data into 10 folds
+  folds <- createFolds(f1y, k = 10)
+  
+  # initialize placeholder for predictions
+  pred_Y1 <- data.frame(rep(NA, length(f1y)), dfw_f1[,2])
+  
+  # crossfitting Y1
+  for (fold in seq_along(folds)) {
+  
+    # this is the training data set
+    train_idx <- setdiff(dfw_f1$`seq(1, 1024)`, folds[[fold]])
+  
+    # ith fold
+    test_idx <- folds[[fold]]
+  
+    # trains a bart model to predict Y0
+    xtrain <- data.frame(dfw_f1[c(train_idx), c(3:ncol(dfw_f1))])
+    xtest <- data.frame(dfw_f1[c(test_idx), c(3:ncol(dfw_f1))])
+    ytrain <- (dfw_f1[c(train_idx), 1])
+    bart_preds <- bart(x.train = xtrain, y.train = ytrain, x.test = xtest)
+  
+    # storing the predicted bart data into the placeholder vectors
+    pred_Y1[test_idx,1] <- bart_preds$yhat.test.mean
+  }
+  
+  seq_df <- data.frame(seq(1, 1024))
+  predict_Y1 <- rep(NA, n)
+  predict_Y1[c(pred_Y1[,2])] <- c(pred_Y1[,1])
+  
+  #BART g
+  y <- df[,6]
+  
+  # split data into 10 folds
+  folds <- createFolds(y, k = 10)
+  
+  # initialize placeholder for predictions
+  predict_D <- rep(NA, n)
+  
+  # crossfitting D
+  for (fold in seq_along(folds)) {
+  
+    # this is the training data set
+    train_idx <- setdiff(seq_len(n), folds[[fold]])
+  
+    # ith fold
+    test_idx <- folds[[fold]]
+  
+    # storing the predicted bart data into the placeholder vectors
+    bart_preds <- pbart(x.train = x[train_idx,], y.train = y[train_idx], x.test = x[test_idx,])
+    predict_D[test_idx] <- bart_preds$prob.test.mean
+    
+  }
+
+  # residuals
+  R_Y0 <- df[,7] - predict_Y0
+  R_Y1 <- df[,8] - predict_Y1
+  R_D <- df[,6] - predict_D
+  
+  # calculate local mean
+  R_D_m <- matrix(R_D, 32, 32)
+  localR_D_m <- matrix(NA, 32, 32)
+  for (i in 1:32) {
+    for (j in 1:32) {
+      # get surroundings (rook)
+      # consider all cases
+      if (i == 1) {
+        if (j == 1) {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i, j+1])
+        }
+        else if (j == 32) {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i, j-1])
+        }
+        else {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i, j+1], R_D_m[i, j-1])
+        }
+      }
+      else if (i == 32) {
+        if (j == 1) {
+          neighbors <- c(R_D_m[i-1, j], R_D_m[i, j+1])
+        }
+        else if (j == 32) {
+          neighbors <- c(R_D_m[i-1, j], R_D_m[i, j-1])
+        }
+        else {
+          neighbors <- c(R_D_m[i-1, j], R_D_m[i, j+1], R_D_m[i, j-1])
+        }      
+      }
+      else {
+        if (j == 1) {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i-1, j], R_D_m[i, j+1])
+        }
+        else if (j == 32) {
+        neighbors <- c(R_D_m[i+1, j], R_D_m[i-1, j], R_D_m[i, j-1])
+        }
+        else {
+          neighbors <- c(R_D_m[i+1, j], R_D_m[i-1, j], 
+                         R_D_m[i, j+1], R_D_m[i, j-1])
+        }
+      }
+    localR_D_m[i,j] <- mean(na.omit(neighbors))   
+    }
+  }
+  localR_D <- as.vector(localR_D_m)
+
+  # regression
+  t <- c(rep(0, n), rep(1, n))
+  regress_DML <- lm(c(R_Y0, R_Y1) ~ t + c(R_D, R_D) + c(localR_D, localR_D) + t*c(R_D, R_D) + t*c(localR_D, localR_D))
+  regress_robust_DML <- lm_robust(c(R_Y0, R_Y1) ~ t + c(R_D, R_D) + c(localR_D, localR_D) + t*c(R_D, R_D) + t*c(localR_D, localR_D))
+  return(list(regress_DML, regress_robust_DML))
+}
+```
+
+Set the smoothness and tau2 in generating and box plot.
+```{r}
+library(ggplot2)
+
+# set seed (forgot to do this for all except smoothness = 1)
+
+
+# data generating variables
+n <- 32 # grid size
+p <- 5  # Number of covariates
+range <- 0.3 # range
+smoothness <- 2 # smoothness
+tau2 <- 1 # Nugget Variance 
+gam <- 3 # gamma
+
+# number of samples
+numSamples <- 120         
+
+# vector of gamma estimators
+gammaOLS <- rep(NA, numSamples)
+gammaDID <- rep(NA, numSamples)
+gammaDML_noSpatial <- rep(NA, numSamples)
+gammaDML_noSpatial_cross <- rep(NA, numSamples)
+gammaDML_noCross <- rep(NA, numSamples)
+gammaDML_cross <- rep(NA, numSamples)
+gammaDML_W_noCross <- rep(NA, numSamples)
+gammaDML_W_cross <- rep(NA, numSamples)
+
+# vector of SE
+seOLS <- rep(NA, numSamples)
+seDID <- rep(NA, numSamples)
+seDML_noSpatial <- rep(NA, numSamples)
+seDML_noSpatial_cross <- rep(NA, numSamples)
+seDML_noCross <- rep(NA, numSamples)
+seDML_cross <- rep(NA, numSamples)
+seDML_W_noCross <- rep(NA, numSamples)
+seDML_W_cross <- rep(NA, numSamples)
+
+for (i in 1:numSamples) {
+  # generate data
+  set.seed(919 * i)
+  df1 <- genData(n, p, range, smoothness, tau2, gam)
+    
+  # OLS
+  OLS_robust <- OLS(df1, 32, 32)
+      
+  # DID
+  DID_robust <- DID(df1, 32, 32)
+  
+  # DML no spatial no cross
+  nospatial <- DML_noSpatial(df1, 32, 32)
+  DML_noSpatial_reg <- nospatial[[1]]
+  DML_noSpatial_robust <- nospatial[[2]]
+      
+  # DML no spatial w cross
+  nospatial_cross <- DML_noSpatial_cross(df1, 32, 32)
+  DML_noSpatial_cross_reg <- nospatial_cross[[1]]
+  DML_noSpatial_cross_robust <- nospatial_cross[[2]]      
+      
+      
+  # DML without crossfitting
+  noCross <- DML_noCross(df1, 32, 32)
+  DML_noCross_reg <- noCross[[1]]
+  DML_noCross_robust <- noCross[[2]]
+  
+  # DML with crossfitting
+  cross <- DML(df1, 32, 32)
+  DML_cross_reg <- cross[[1]]
+  DML_cross_robust <- cross[[2]]
+  
+  # DML with Wendland (no cross)
+  wendNoCross <- DML_wend(df1, 32, 32)
+  DML_wendNoCross_reg <- wendNoCross[[1]]
+  DML_wendNoCross_robust <- wendNoCross[[2]] 
+  
+  # DML with Wendland (with cross)
+  wendCross <- DML_wend_cross(df1, 32, 32)
+  DML_wendCross_reg <- wendCross[[1]]
+  DML_wendCross_robust <- wendCross[[2]]   
+  
+  # calculate gammas
+  gammaOLS[i] <- OLS_robust$coefficients[[7]]
+  gammaDID[i] <- DID_robust$coefficients[[8]]
+  gammaDML_noSpatial[i] <- DML_noSpatial_robust$coefficients[[5]]
+  gammaDML_noSpatial_cross[i] <- DML_noSpatial_cross_robust$coefficients[[5]]
+  gammaDML_noCross[i] <- DML_noCross_robust$coefficients[[5]]
+  gammaDML_cross[i] <- DML_cross_robust$coefficients[[5]]
+  gammaDML_W_noCross[i] <- DML_wendNoCross_robust$coefficients[[5]]
+  gammaDML_W_cross[i] <- DML_wendCross_robust$coefficients[[5]]
+  
+  # calculate SE
+  seOLS[i] <- OLS_robust$std.error[[7]]
+  seDID[i] <- DID_robust$std.error[[8]]
+  seDML_noSpatial[i] <- DML_noSpatial_robust$std.error[[5]]
+  seDML_noSpatial_cross[i] <- DML_noSpatial_cross_robust$std.error[[5]]
+  seDML_noCross[i] <- DML_noCross_robust$std.error[[5]]
+  seDML_cross[i] <- DML_cross_robust$std.error[[5]] 
+  seDML_W_noCross <- DML_wendNoCross_robust$std.error[[5]]
+  seDML_W_cross <- DML_wendCross_robust$std.error[[5]]
+}
+
+# expected value for gamma
+meanGamma <- rep(NA, 8) # meanGamma is my predictor of gamma for each method
+meanGamma[1] <- mean(na.omit(gammaOLS))
+meanGamma[2] <- mean(na.omit(gammaDID))
+meanGamma[3] <- mean(na.omit(gammaDML_noSpatial))
+meanGamma[4] <- mean(na.omit(gammaDML_noSpatial_cross))
+meanGamma[5] <- mean(na.omit(gammaDML_noCross))
+meanGamma[6] <- mean(na.omit(gammaDML_cross))
+meanGamma[7] <- mean(na.omit(gammaDML_W_noCross))
+meanGamma[8] <- mean(na.omit(gammaDML_W_cross))
+
+# calculate bias for gamma
+biasGamma <- rep(NA, 8)
+biasGamma[1] <- mean(meanGamma[1] - gam)
+biasGamma[2] <- mean(meanGamma[2] - gam)
+biasGamma[3] <- mean(meanGamma[3] - gam)
+biasGamma[4] <- mean(meanGamma[4] - gam)
+biasGamma[5] <- mean(meanGamma[5] - gam)
+biasGamma[6] <- mean(meanGamma[6] - gam)
+biasGamma[7] <- mean(meanGamma[7] - gam)
+biasGamma[8] <- mean(meanGamma[8] - gam)
+
+# calculate relative bias for gamma (bias / gamma)
+relBiasGamma <- rep(NA, 8)
+relBiasGamma[1] <- biasGamma[1] / gam
+relBiasGamma[2] <- biasGamma[2] / gam
+relBiasGamma[3] <- biasGamma[3] / gam
+relBiasGamma[4] <- biasGamma[4] / gam
+relBiasGamma[5] <- biasGamma[5] / gam
+relBiasGamma[6] <- biasGamma[6] / gam
+relBiasGamma[7] <- biasGamma[7] / gam
+relBiasGamma[8] <- biasGamma[8] / gam
+
+# calculate MSE for gamma
+mseGamma <- rep(NA, 8)
+mseGamma[1] <- mean((gammaOLS - gam)**2)
+mseGamma[2] <- mean((gammaDID - gam)**2)
+mseGamma[3] <- mean((gammaDML_noSpatial - gam)**2)
+mseGamma[4] <- mean((gammaDML_noSpatial_cross - gam)**2)
+mseGamma[5] <- mean((gammaDML_noCross - gam)**2)
+mseGamma[6] <- mean((gammaDML_cross - gam)**2)
+mseGamma[7] <- mean((gammaDML_W_noCross - gam)**2)
+mseGamma[8] <- mean((gammaDML_W_cross - gam)**2)
+
+# calculate SE for gamma 
+seGamma <- rep(NA, 8) # seGamma is my predictor of SE for each method
+seGamma[1] <- mean(na.omit(seOLS))
+seGamma[2] <- mean(na.omit(seDID))
+seGamma[3] <- mean(na.omit(seDML_noSpatial))
+seGamma[4] <- mean(na.omit(seDML_noSpatial_cross))
+seGamma[5] <- mean(na.omit(seDML_noCross))
+seGamma[6] <- mean(na.omit(seDML_cross))
+seGamma[7] <- mean(na.omit(seDML_W_noCross))
+seGamma[8] <- mean(na.omit(seDML_W_cross))
+
+# expected confidence interval length (95%)
+lengthCI <- rep(NA, 8)
+lengthCI[1] <- 2 * 1.96 * seGamma[1] 
+lengthCI[2] <- 2 * 1.96 * seGamma[2]
+lengthCI[3] <- 2 * 1.96 * seGamma[3]
+lengthCI[4] <- 2 * 1.96 * seGamma[4]
+lengthCI[5] <- 2 * 1.96 * seGamma[5] 
+lengthCI[6] <- 2 * 1.96 * seGamma[6]
+lengthCI[7] <- 2 * 1.96 * seGamma[7] 
+lengthCI[8] <- 2 * 1.96 * seGamma[8] 
+
+# calculate coverage (% of each gamma predicted within individual confidence interval (95%))
+# note: this is not using the average confidence interval length calculated above
+cvgGamma <- rep(NA, 8)
+cvgGamma[1] <- mean((gam <= gammaOLS + 1.96*seOLS) & (gam >= gammaOLS - 1.96*seOLS))
+cvgGamma[2] <- mean((gam <= gammaDID + 1.96*seDID) & (gam >= gammaDID - 1.96*seDID))
+cvgGamma[3] <- mean((gam <= gammaDML_noSpatial + 1.96*seDML_noSpatial) & (gam >= gammaDML_noSpatial - 1.96*seDML_noSpatial))
+cvgGamma[4] <- mean((gam <= gammaDML_noSpatial_cross + 1.96*seDML_noSpatial_cross) & (gam >= gammaDML_noSpatial_cross - 1.96*seDML_noSpatial_cross))
+cvgGamma[5] <- mean((gam <= gammaDML_noCross + 1.96*seDML_noCross) & (gam >= gammaDML_noCross - 1.96*seDML_noCross))
+cvgGamma[6] <- mean((gam <= gammaDML_cross + 1.96*seDML_cross) & (gam >= gammaDML_cross - 1.96*seDML_cross))
+cvgGamma[7] <- mean((gam <= gammaDML_W_noCross + 1.96*seDML_W_noCross) & (gam >= gammaDML_W_noCross - 1.96*seDML_W_noCross))
+cvgGamma[8] <- mean((gam <= gammaDML_W_cross + 1.96*seDML_W_cross) & (gam >= gammaDML_W_cross - 1.96*seDML_W_cross))
+
+# calculate power (% of confidence intervals (95%) that rightfully reject gamma = 0)
+powerGamma <- rep(NA, 8)
+powerGamma[1] <- mean(!((0 <= gammaOLS + 1.96*seOLS) & (0 >= gammaOLS - 1.96*seOLS)))
+powerGamma[2] <- mean(!((0 <= gammaDID + 1.96*seDID) & (0 >= gammaDID - 1.96*seDID)))
+powerGamma[3] <- mean(!((0 <= gammaDML_noSpatial + 1.96*seDML_noSpatial) & (0 >= gammaDML_noSpatial - 1.96*seDML_noSpatial)))
+powerGamma[4] <- mean(!((0 <= gammaDML_noSpatial_cross + 1.96*seDML_noSpatial_cross) & (0 >= gammaDML_noSpatial_cross - 1.96*seDML_noSpatial_cross)))
+powerGamma[5] <- mean(!((0 <= gammaDML_noCross + 1.96*seDML_noCross) & (0 >= gammaDML_noCross - 1.96*seDML_noCross)))
+powerGamma[6] <- mean(!((0 <= gammaDML_cross + 1.96*seDML_cross) & (0 >= gammaDML_cross - 1.96*seDML_cross)))
+powerGamma[7] <- mean(!((0 <= gammaDML_W_noCross + 1.96*seDML_W_noCross) & (0 >= gammaDML_W_noCross - 1.96*seDML_W_noCross)))
+powerGamma[8] <- mean(!((0 <= gammaDML_W_cross + 1.96*seDML_W_cross) & (0 >= gammaDML_W_cross - 1.96*seDML_W_cross)))
+
+################################################################################
+# box plot
+
+# Combine all gamma differences into a data frame
+method <- factor(rep(c("OLS", "DID", "DML no spatial no cross","DML no spatial with cross", "DML lat/long", "DML lat/long with cross", "Wend without cross", "Wend with cross"),
+                     each = length(gammaOLS)),
+                 levels = c("OLS", "DID", "DML no spatial no cross","DML no spatial with cross", "DML lat/long", "DML lat/long with cross", "Wend without cross", "Wend with cross"))
+
+df <- data.frame(
+  method = method,
+  value = c(gammaOLS - gam,
+            gammaDID - gam, gammaDML_noSpatial - gam, gammaDML_noSpatial_cross - gam,
+            gammaDML_noCross - gam,
+            gammaDML_cross - gam,
+            gammaDML_W_noCross - gam,
+            gammaDML_W_cross - gam)
+)
+
+# Create plot
+box <- ggplot(df, aes(x = method, y = value)) + geom_boxplot() +
+  labs(title = "Bias in Treatment Effect Predictor (No Random Effects)",
+       y = expression(hat(gamma) - gamma),
+       x = "") + theme_bw() +
+  theme(axis.text.x = element_text(size = 8),
+        axis.text.y = element_text(size = 12),
+        axis.title.y = element_text(size = 20),
+        plot.title = element_text(size = 20)) + 
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black")
+
+################################################################################
+```
+
+Store results (input smoothness and tau2 here)
+```{r}
+initialConditions <- c(n = n, p = p, range = range, smoothness = smoothness, tau2 = tau2, gam = gam)
+results <- data.frame(meanGamma, biasGamma, relBiasGamma, mseGamma, seGamma, lengthCI, cvgGamma, powerGamma)
+boxplot <- box
+
+# save as an R data file
+save(initialConditions, results, boxplot, numSamples, gammaOLS, gammaDID, gammaDML_noCross, gammaDML_cross, gammaDML_W_noCross, gammaDML_W_cross, seOLS, seDID, seDML_noCross, seDML_cross, seDML_W_cross, seDML_W_noCross, file = "Duncansboxplots.RData")
+```
+
+
+
+
