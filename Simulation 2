@@ -1564,6 +1564,6 @@ boxplot <- box
 
 
 # save as an R data file
-#save(initialConditions, results, boxplot, numSamples, gammaOLS, gammaDID, gammaDML_noCross, gammaDML_cross, gammaDML_W_noCross, gammaDML_W_cross, seOLS, seDID, seDML_noCross, seDML_cross, seDML_W_cross, seDML_W_noCross, file = "both-methods-RE-includes-LatLong_250samps.RData")
+save(initialConditions, results, boxplot, numSamples, gammaOLS, gammaDID, gammaDML_noCross, gammaDML_cross, gammaDML_W_noCross, gammaDML_W_cross, seOLS, seDID, seDML_noCross, seDML_cross, seDML_W_cross, seDML_W_noCross, file = "both-methods-RE-includes-LatLong_250samps.RData")
 
 ```
