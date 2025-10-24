@@ -1029,9 +1029,6 @@ Set the smoothness and tau2 in generating and box plot.
 ```{r}
 library(ggplot2)
 
-# set seed (forgot to do this for all except smoothness = 1)
-
-
 # data generating variables
 n <- 32 # grid size
 p <- 5  # Number of covariates
